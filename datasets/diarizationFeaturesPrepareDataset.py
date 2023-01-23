@@ -1,4 +1,6 @@
 import os
+import pickle
+import shutil
 import math
 import numpy as np
 import torch
@@ -24,25 +26,35 @@ from speechbrain.pretrained import SpeakerRecognition
 
 class DiarizationFeaturesPrepareDataset:
 
-    def __init__(self, wav_dir_lst, output_dir, feature_extractor_model, target_sr, min_spk=1, max_spk=10,
-                 min_dur=1.0, max_dur=7.0, min_utt=10, max_utt=15, win_step=0.75, win_size=1.5, speaker_sep='_',
-                 device='cpu'):
+    def __init__(self, output_dir, wav_dir_lst=None, features_dir=None, feature_extractor_model=None, target_sr=16000,
+                 min_spk=1, max_spk=10, min_dur=1.0, max_dur=7.0, min_utt=10, max_utt=15, win_step=0.75, win_size=1.5,
+                 speaker_sep='_', device='cpu'):
 
         ##################
         #
         # initialize variables
         #
         ##################
-        wav_lst = list()
 
-        if isinstance(wav_dir_lst, list):
-            for d in wav_dir_lst:
-                curr_wav_p = list(map(lambda x: os.path.join(d, x), os.listdir(d)))
-                wav_lst.extend(curr_wav_p)
-        elif isinstance(wav_dir_lst, str):
-            wav_lst = list(map(lambda x: os.path.join(wav_dir_lst, x), os.listdir(wav_dir_lst)))
+        assert wav_dir_lst is not None or features_dir is not None, 'One of wav_dir_lst and features_dir must be not ' \
+                                                                    'None!'
+        wav_lst = list()
+        files_lst = list()
+        self._wav_based = False
+
+        if wav_dir_lst is not None:
+            if isinstance(wav_dir_lst, list):
+                for d in wav_dir_lst:
+                    curr_wav_p = list(map(lambda x: os.path.join(d, x), os.listdir(d)))
+                    wav_lst.extend(curr_wav_p)
+            elif isinstance(wav_dir_lst, str):
+                wav_lst = list(map(lambda x: os.path.join(wav_dir_lst, x), os.listdir(wav_dir_lst)))
+            else:
+                raise NotImplemented
+            files_lst = wav_lst
+            self._wav_based = True
         else:
-            raise NotImplemented
+            files_lst = list(map(lambda x: os.path.join(features_dir, x), os.listdir(features_dir)))
 
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
@@ -69,18 +81,18 @@ class DiarizationFeaturesPrepareDataset:
         self.unique_speakers = set()
         self.spk2utt = {}
 
-        for wav_p in tqdm(wav_lst):
-            wav_name = os.path.splitext(os.path.basename(wav_p))[0]
+        for file_p in tqdm(files_lst):
+            wav_name = os.path.splitext(os.path.basename(file_p))[0]
             speaker_id = wav_name.split(speaker_sep)[0]
             self.unique_speakers.add(speaker_id)
             if speaker_id not in self.spk2utt:
                 self.spk2utt[speaker_id] = []
-            self.spk2utt[speaker_id].append(wav_p)
+            self.spk2utt[speaker_id].append(file_p)
 
         self.unique_speakers = list(self.unique_speakers)
         self.label_encoder = preprocessing.LabelEncoder().fit(self.unique_speakers)
 
-    def make_single(self):
+    def make_single_wav(self):
         feats = []
         labels = []
         num_speakers = np.random.randint(low=self.min_spk, high=self.max_spk + 1)
@@ -131,17 +143,66 @@ class DiarizationFeaturesPrepareDataset:
         labels = self.label_encoder.transform(labels)
         return np.stack(feats), np.array(labels)
 
+    def make_single_feats(self):
+        feats = []
+        labels = []
+        num_speakers = np.random.randint(low=self.min_spk, high=self.max_spk + 1)
+        num_utt = np.random.randint(low=self.min_utt, high=self.max_utt + 1)
+        target_speakers = np.random.choice(self.unique_speakers, size=num_speakers, replace=False)
+        # all_slice = np.zeros((1, 0))
+
+        for i in range(num_utt):
+            dur = np.random.uniform(low=self.min_dur, high=self.max_dur)
+            num_feats = math.ceil(dur / 0.75)
+
+            spk = np.random.choice(target_speakers)
+            spk_utt = np.random.choice(self.spk2utt[spk])
+            data = np.load(spk_utt)
+            actual_num_feats = data.shape[0]
+
+            if actual_num_feats < num_feats:
+                orig_data = copy(data)
+                orig_num_feats = actual_num_feats
+                while actual_num_feats < num_feats:
+                    data = np.concatenate((data, orig_data), axis=0)
+                    actual_num_feats += orig_num_feats
+
+            bias = actual_num_feats - num_feats
+            if bias > 0:
+                start_idx = np.random.randint(low=0, high=bias)
+            else:
+                start_idx = 0
+
+            feats.append(data[start_idx: start_idx + num_feats])
+            labels.extend([spk] * num_feats)
+
+        labels = self.label_encoder.transform(labels)
+
+        feats = np.vstack(feats).astype(float)
+        labels = np.asanyarray(labels).astype(str)
+        return feats, labels
+
     def make_dataset(self, num_samples=100000):
         feats_lst = []
         labels_lst = []
 
-        with Pool(10) as p:
-            results = p.starmap(self.make_single, [() for _ in range(num_samples)])
+        if self._wav_based:
+            func = self.make_single_wav
+        else:
+            func = self.make_single_feats
 
+        with Pool(10) as p:
+            results = p.starmap(func, [() for _ in range(num_samples)])
+
+        for p in results:
+            feats_lst.append(p[0])
+            labels_lst.append(p[1])
         # np.save(file=os.path.join(self.output_dir, 'features.npy'),
         #         arr=feats_lst)
         # np.save(file=os.path.join(self.output_dir, 'labels.npy'),
         #         arr=labels_lst)
+        pickle.dump(feats_lst, open(os.path.join(self.output_dir, 'features.npy'), 'wb'))
+        pickle.dump(labels_lst, open(os.path.join(self.output_dir, 'labels.npy'), 'wb'))
 
     @staticmethod
     def extract_all_vectors(wav_dir, save_dir, model, target_sr, win_size_dur, win_step_dur, device):
@@ -179,22 +240,20 @@ if __name__ == '__main__':
     speaker_recognition_model = SpeakerRecognition.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb",
                                                                 savedir="../pretrained_models/spkrec-ecapa-voxceleb",
                                                                 run_opts={"device": "mps"})
-    # dataset = DiarizationFeaturesPrepareDataset(feature_extractor_model=speaker_recognition_model,
-    #                                             wav_dir_lst='/Users/ananaskelly/work_dir/datasets/'
-    #                                                         'voxceleb_concatenated_listed',
-    #                                             output_dir='/Users/ananaskelly/work_dir/ecapa_features_uisrnn_train_v1',
-    #                                             target_sr=16000)
-    # dataset.make_dataset(num_samples=5)
+    dataset = DiarizationFeaturesPrepareDataset(features_dir='/Users/ananaskelly/work_dir/datasets/'
+                                                             'voxceleb_concatenated_listed_ecapa_vectors',
+                                                output_dir='/Users/ananaskelly/work_dir/ecapa_features_uisrnn_train_v1')
+    dataset.make_dataset(num_samples=100000)
 
-    DiarizationFeaturesPrepareDataset.extract_all_vectors(wav_dir='/Users/ananaskelly/work_dir/datasets/'
-                                                                  'voxceleb_concatenated_listed',
-                                                          save_dir='/Users/ananaskelly/work_dir/datasets/'
-                                                                   'voxceleb_concatenated_listed',
-                                                          model=speaker_recognition_model,
-                                                          target_sr=16000,
-                                                          win_size_dur=1.5,
-                                                          win_step_dur=0.75,
-                                                          device='mps')
+    # DiarizationFeaturesPrepareDataset.extract_all_vectors(wav_dir='/Users/ananaskelly/work_dir/datasets/'
+    #                                                               'voxceleb_concatenated_listed',
+    #                                                       save_dir='/Users/ananaskelly/work_dir/datasets/'
+    #                                                                'voxceleb_concatenated_listed_ecapa_vectors',
+    #                                                       model=speaker_recognition_model,
+    #                                                       target_sr=16000,
+    #                                                       win_size_dur=1.5,
+    #                                                       win_step_dur=0.75,
+    #                                                       device='mps')
 
     # data = np.load('/Users/ananaskelly/work_dir/test_features_prepare/features.npy', allow_pickle=True)
     # print(data[0].shape)

@@ -187,4 +187,5 @@ fabric.properties
 test_pics/**
 test_files/**
 test.py
-uis-rnn
+uis_rnn_module
+uis_rnn_module/**
